@@ -1,10 +1,11 @@
-# Processing intubation force/torque data.
+# Pre-processing intubation force/torque data.
 # This file is used to identify intubation trials, label the data as either during or not during intubation, downsample the data,
 # normalize the data, and create examples (windows of data) for the model to train on. 
 
 # This file creates both training and development data sets. 
 
 import numpy as np
+import os
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy import signal
@@ -52,7 +53,6 @@ def downsampleFTData(data, fs= 7000, fsDesired = 250, dataColumns = ["Fx","Fy","
         x = data[column].to_numpy()
         # Use signal.resample_poly(x, up, down) to downsample each column - has built in anti-aliasing 
         downsampled[column] = signal.resample_poly(x, up=up, down=down)
-        # print(downsampled[column])
         
     downsampledFT = pd.DataFrame(downsampled)
     
@@ -172,13 +172,13 @@ def createMixedExamples(data, columns, Tx=128, stride=16, transitionStride=1):
     return X, Y, starts
 
 #  ---------------------------------------------------------------------------------------------------------------
+# All subjects with "good" data - determined by plotting and observing clear force/torque changes during intubation trials
 subjects = ["13", "35",	"36",	"31",	"47",	"67",	"75",	"74",	"53",	
             "23",	"39",	"52",	"11",	"2",	"64",	"9",	"45",	"19",	
             "68",	"73",	"44",	"58",	"50",	"49",	"40",	"14",	"25"]
 
 # Read start/stop frame file
 startStopDP = pd.read_csv("StartStopSequenceNumbers.csv")
-# startStopDP = startStopDP.iloc[2:]
 
 # List indices for each trial
 trialIndices = {
@@ -190,34 +190,6 @@ trialIndices = {
     "trial6Term": (10, 11),
 }
 
-# # Clearly labeled data (hoping for more)
-# subjectLabels = {
-#     "23": {
-#         "m": 694.52, #773.32,
-#         "b": 59913 #-263896
-#     },
-#     "47": {
-#         "m": 699.95, #773.32,
-#         "b": -192936 #-263896
-#     },
-#     "67": {
-#         "m": 700,
-#         "b": -794998
-#     },
-#     "74": {
-#         "m": 704.24,
-#         "b": -8601.3
-#     },
-#     "75": {
-#         "m": 700.8,
-#         "b": -258441
-#     },
-#     "31": { 
-#         "m": 700.6,
-#         "b": -3948624.272
-#     }
-# }
-
 # Columns in the force/torque data 
 fColumns = ['Fx', 'Fy', 'Fz']
 tColumns = ['Tx', 'Ty', 'Tz']
@@ -225,19 +197,14 @@ countsPerForceUnit = 224809
 countsPerTorqueUnit = 8850746
 
 # Dictionary to store all trials for all subjects
-# Access pattern: allSubjectTrials[subject_id][trial_name]
 allSubjectTrials = {}
 
 # Loop through each subject 
 for subj_id in subjects:
-# for subj_id, params in subjectLabels.items():
     # Get the column for this subject
     pStartStopDP = startStopDP[subj_id]
     pStartStopDP = pd.to_numeric(pStartStopDP, errors="coerce")
-
-    # Apply subject-specific linear transform
-    # pStartStopDP = pStartStopDP * params["m"] + params["b"]
-
+    
     # Load this subject's force/torque data
     forceTorqueData = pd.read_csv(
         rf"OMSNI_ForceData\OMSNI {subj_id}",
@@ -245,12 +212,14 @@ for subj_id in subjects:
         sep=r'\s+',
     )
     
+    # Convert counts to force/torque units
     for column in fColumns:
         forceTorqueData[column] = pd.to_numeric(forceTorqueData[column], errors="coerce")/countsPerForceUnit
     
     for column in tColumns:
         forceTorqueData[column] = pd.to_numeric(forceTorqueData[column], errors="coerce")/countsPerTorqueUnit
 
+    # Add label column initialized to -1 (unknown)
     y = -1*np.ones((len(forceTorqueData), 1))
     forceTorqueData["y"] = y
     
@@ -270,12 +239,10 @@ for subj_id in subjects:
 ## LABELING
 # Loop through each subject for labeling
 for subj_id in subjects:
-# for subj_id, params in subjectLabels.items():
-    # Get the column for this subject (needed for labeling)
+    # Get start/stop sequences for this subject
     pStartStopDP = startStopDP[subj_id]
     pStartStopDP = pd.to_numeric(pStartStopDP, errors="coerce")
-    # pStartStopDP = pStartStopDP * params["m"] + params["b"]
-    
+
     # Get this subject's trials
     subjectTrials = allSubjectTrials[subj_id]
     
@@ -283,16 +250,17 @@ for subj_id in subjects:
     for trialName, trialDf in subjectTrials.items():
         y = np.zeros((len(trialDf), 1))
         trialDf["y"] = y
-        # print(f"Subject {subj_id}, {trialName}")
         
         i, j = trialIndices[trialName]
         
+        # Then determine when intubation is happening and label those as 1s
         location = trialDf.loc[
         trialDf["Sequence"].between(pStartStopDP[i], pStartStopDP[j], inclusive="both")
         ]
         trialDf.loc[location.index, "y"] = 1
     
-    
+
+# Plot some example trials to verify labeling - this was just for verification and debugging purposes
 fig, axes = plt.subplots(2, 1, figsize=(12, 8))
 ax = axes.flat[0]
 ax.plot(allSubjectTrials["75"]["trial1Pre"]['Sequence'], allSubjectTrials["75"]["trial1Pre"]['Fx'])
@@ -327,11 +295,14 @@ Y = None
 starts = None
 trialIDs = None
 
-# Track which trial and task each example came from
-trial_labels = []  # Will store (subject_id, trial_name, task_name) for each example
-trial_length_map = {}  # Map trial ID string to its length
+# Track which trial and task each example came from to ensure even distribution later
+trial_labels = []  
+trial_length_map = {}  
 
-# for subj_id, params in subjectLabels.items():
+yArrays = []  
+trial_ids_per_trial = [] 
+
+
 for subj_id in subjects:
     # Get this subject's trials
     subjectTrials = allSubjectTrials[subj_id]
@@ -360,13 +331,17 @@ for subj_id in subjects:
         trialDf = downsampleFTData(trialDf)
         
         Xt, Yt, startst = createMixedExamples(trialDf, columns)
-        # createExamples(trialDf, columns)
         
-        # build a compact trial id string and an array of that id repeated
+        # Build trial ID array
         trialIDstr = f"{subj_id}_{trialName}"
         trialIDt = np.array([trialIDstr] * len(startst), dtype=object)
         
         trial_length_map[trialIDstr] = len(trialDf)
+        
+        # Save per-trial y array and the trial id string
+        yArrays.append(trialDf['y'].to_numpy().ravel())
+        trial_ids_per_trial.append(trialIDstr)
+        
         # Determine which task this trial belongs to
         task_name = 'Pre' if trialName in taskGroups['Pre'] else 'Term'
         
@@ -374,14 +349,14 @@ for subj_id in subjects:
         num_examples = Xt.shape[0]
         trial_labels.extend([(subj_id, trialName, task_name)] * num_examples)
         
+        # If first trial, initialize X and Y
         if X is None:
-            # First trial - initialize X and Y
             X = Xt
             Y = Yt
             starts = startst
             trialIDs = trialIDt
+        # Else, concatenate to existing arrays
         else:
-            # Subsequent trials - concatenate
             X = np.concatenate((X, Xt))
             Y = np.concatenate((Y, Yt))
             starts = np.concatenate((starts, startst))
@@ -395,18 +370,16 @@ Y = Y.reshape(m, 128, 1)
 # print(Y.shape)
 # print(m)
 
-# Categorize examples by averaging labels over time dimension
-# Y has shape (m, 128, 1), so we average over axis=1 to get mean label per example
-Y_mean = np.mean(Y, axis=1).flatten()  # Shape: (m,)
+# Categorize examples by averaging labels over timestep dimension
+Y_mean = np.mean(Y, axis=1).flatten() 
 
-# Categorize examples: all 0s (mean=0), all 1s (mean=1), mixed (0 < mean < 1)
-# Use small epsilon to account for floating point precision
+# Categorize examples: all 0s (mean=0), all 1s (mean=1), transition (0 < mean < 1)
 epsilon = 1e-6
 all_zeros = Y_mean < epsilon
 all_ones = Y_mean > (1 - epsilon)
 mixed = ~(all_zeros | all_ones)
 
-# Create label category: 0 = all zeros, 1 = all ones, 2 = mixed
+# Create label category: 0 = all zeros, 1 = all ones, 2 = transition
 label_categories = np.zeros(m, dtype=int)
 label_categories[all_ones] = 1
 label_categories[mixed] = 2
@@ -418,9 +391,8 @@ task_categories = np.zeros(m, dtype=int)
 task_categories[task_labels == 'Term'] = 1
 
 # Create combined stratification: combines label category and task type
-# This ensures balanced distribution of both label types AND task types
-# Format: label_category * 10 + task_category (e.g., 0=all0s+Pre, 1=all0s+Term, 10=all1s+Pre, 11=all1s+Term, 20=mixed+Pre, 21=mixed+Term)
-combined_stratify = label_categories * 10 + task_categories
+# This ensures balanced distribution of both label types and task types
+combinedStratify = label_categories * 10 + task_categories
 
 # Print distribution
 print("\nExample distribution by label type:")
@@ -436,11 +408,10 @@ print("\nExample distribution by combined category:")
 for label_name, label_val in [("All 0s", 0), ("All 1s", 1), ("Mixed", 2)]:
     for task_name, task_val in [("Pre", 0), ("Term", 1)]:
         combined_val = label_val * 10 + task_val
-        count = np.sum(combined_stratify == combined_val)
+        count = np.sum(combinedStratify == combined_val)
         print(f"  {label_name} + {task_name}: {count} ({100*count/m:.1f}%)")
 
 # Shuffle and split into train/test sets with stratified sampling
-# This ensures balanced distribution of both label categories AND task types
 test_size = 0.3
 random_state = 42
 
@@ -450,7 +421,7 @@ train_indices, test_indices = train_test_split(
     indices,
     test_size=test_size,
     random_state=random_state,
-    stratify=combined_stratify  # Ensures balanced distribution of both label and task categories
+    stratify=combinedStratify 
 )
 
 # Split X and Y using the same indices
@@ -477,31 +448,29 @@ test_task_labels = task_labels[test_indices]
 
 print(f"\n{'='*60}")
 print(f"Train set: {len(X_train)} examples")
-print(f"  Label distribution:")
-print(f"    All 0s: {np.sum(train_all_zeros)} ({100*np.sum(train_all_zeros)/len(X_train):.1f}%)")
-print(f"    All 1s: {np.sum(train_all_ones)} ({100*np.sum(train_all_ones)/len(X_train):.1f}%)")
-print(f"    Mixed: {np.sum(train_mixed)} ({100*np.sum(train_mixed)/len(X_train):.1f}%)")
-print(f"  Task distribution:")
-print(f"    Pre: {np.sum(train_task_labels == 'Pre')} ({100*np.sum(train_task_labels == 'Pre')/len(X_train):.1f}%)")
-print(f"    Term: {np.sum(train_task_labels == 'Term')} ({100*np.sum(train_task_labels == 'Term')/len(X_train):.1f}%)")
+print(f"Label distribution:")
+print(f"All 0s: {np.sum(train_all_zeros)} ({100*np.sum(train_all_zeros)/len(X_train):.1f}%)")
+print(f"All 1s: {np.sum(train_all_ones)} ({100*np.sum(train_all_ones)/len(X_train):.1f}%)")
+print(f"Mixed: {np.sum(train_mixed)} ({100*np.sum(train_mixed)/len(X_train):.1f}%)")
+print(f"Task distribution:")
+print(f"Pre: {np.sum(train_task_labels == 'Pre')} ({100*np.sum(train_task_labels == 'Pre')/len(X_train):.1f}%)")
+print(f"Term: {np.sum(train_task_labels == 'Term')} ({100*np.sum(train_task_labels == 'Term')/len(X_train):.1f}%)")
 
 print(f"\nTest set: {len(X_test)} examples")
-print(f"  Label distribution:")
-print(f"    All 0s: {np.sum(test_all_zeros)} ({100*np.sum(test_all_zeros)/len(X_test):.1f}%)")
-print(f"    All 1s: {np.sum(test_all_ones)} ({100*np.sum(test_all_ones)/len(X_test):.1f}%)")
-print(f"    Mixed: {np.sum(test_mixed)} ({100*np.sum(test_mixed)/len(X_test):.1f}%)")
-print(f"  Task distribution:")
-print(f"    Pre: {np.sum(test_task_labels == 'Pre')} ({100*np.sum(test_task_labels == 'Pre')/len(X_test):.1f}%)")
-print(f"    Term: {np.sum(test_task_labels == 'Term')} ({100*np.sum(test_task_labels == 'Term')/len(X_test):.1f}%)")
+print(f"Label distribution:")
+print(f"All 0s: {np.sum(test_all_zeros)} ({100*np.sum(test_all_zeros)/len(X_test):.1f}%)")
+print(f"All 1s: {np.sum(test_all_ones)} ({100*np.sum(test_all_ones)/len(X_test):.1f}%)")
+print(f"Mixed: {np.sum(test_mixed)} ({100*np.sum(test_mixed)/len(X_test):.1f}%)")
+print(f"Task distribution:")
+print(f"Pre: {np.sum(test_task_labels == 'Pre')} ({100*np.sum(test_task_labels == 'Pre')/len(X_test):.1f}%)")
+print(f"Term: {np.sum(test_task_labels == 'Term')} ({100*np.sum(test_task_labels == 'Term')/len(X_test):.1f}%)")
 print(f"{'='*60}")
 
-# Save train and test sets
+# Save train and test sets, starts, and trial IDs
 np.save('X_train.npy', X_train)
 np.save('Y_train.npy', Y_train)
 np.save('X_test.npy', X_test)
 np.save('Y_test.npy', Y_test)
-# starts_train/test and trialIDs_train/test are already the subset arrays
-# created via indexing earlier, so save them directly (do NOT re-index)
 np.save('starts_train.npy', starts_train)
 np.save('starts_test.npy',  starts_test)
 np.save('trial_ids_train.npy', trialIDs_train)
@@ -512,8 +481,12 @@ print(f"X_train shape: {X_train.shape}, Y_train shape: {Y_train.shape}")
 print(f"X_test shape: {X_test.shape}, Y_test shape: {Y_test.shape}")
 
 
-# Haven't tested yet 
-# readable length map
+# Save trial length map to JSON for easy lookup
 import json
 with open('trial_length_map.json','w') as f:
     json.dump(trial_length_map, f, indent=2)
+
+# Save per-trial arrays alongside their trial ids
+np.savez_compressed('dataY_by_trial.npz',
+                    trial_ids=np.array(trial_ids_per_trial, dtype=object),
+                    y_arrays=np.array(yArrays, dtype=object))
